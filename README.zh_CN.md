@@ -16,6 +16,17 @@
 
 **Eino['aino]** 是一个 Go 语言的 LLM 应用开发框架，借鉴了 LangChain、Google ADK 等开源项目，按照 Go 的惯例设计。
 
+## 本地源码解析站点
+
+仓库的 `docs/` 目录包含一套基于 VitePress 的源码解析文档。ADK 部分详细覆盖 Agent 生命周期、Agent/Runner/ChatModelAgent 边界、Context 与 Option 转换、Middleware、Callback、事件、工作流、转交和中断恢复。
+
+```bash
+npm install
+npm run docs:dev
+```
+
+使用 `npm run docs:build` 生成生产构建，使用 `npm run docs:preview` 在本地预览构建结果。
+
 Eino 提供：
 - **[组件](https://github.com/cloudwego/eino-ext)**：`ChatModel`、`Tool`、`Retriever`、`ChatTemplate` 等可复用模块，官方实现覆盖 OpenAI、Ollama 等
 - **智能体开发套件（ADK）**：支持工具调用、多智能体协同、上下文管理、中断/恢复等人机交互，以及开箱即用的智能体模式

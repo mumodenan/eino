@@ -16,6 +16,17 @@ English | [中文](README.zh_CN.md)
 
 **Eino['aino]** is an LLM application development framework in Golang. It draws from LangChain, Google ADK, and other open-source frameworks, and is designed to follow Golang conventions.
 
+## Local implementation guide
+
+This repository includes a VitePress-based source-code guide under `docs/`, with an in-depth ADK walkthrough covering the Agent lifecycle, Runner/ChatModelAgent boundaries, Context and Option conversion, middleware, callbacks, events, workflows, transfer, and interrupt/resume.
+
+```bash
+npm install
+npm run docs:dev
+```
+
+Use `npm run docs:build` for a production build and `npm run docs:preview` to preview it locally.
+
 Eino provides:
 - **[Components](https://github.com/cloudwego/eino-ext)**: reusable building blocks like `ChatModel`, `Tool`, `Retriever`, and `ChatTemplate`, with official implementations for OpenAI, Ollama, and more.
 - **Agent Development Kit (ADK)**: build AI agents with tool use, multi-agent coordination, context management, interrupt/resume for human-in-the-loop, and ready-to-use agent patterns.

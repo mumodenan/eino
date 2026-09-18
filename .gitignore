@@ -64,3 +64,8 @@ CLAUDE.md
 
 # Internal dev setup (not for public repo)
 /scripts/dev_setup_internal.sh
+
+# VitePress documentation
+node_modules/
+docs/.vitepress/cache/
+docs/.vitepress/dist/
