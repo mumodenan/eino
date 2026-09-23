@@ -15,6 +15,17 @@ function refreshAvailability(): void {
   available.value = document.querySelector('.VPDoc.has-aside') !== null
 }
 
+function readInitialState(): boolean {
+  try {
+    const saved = window.localStorage.getItem(STORAGE_KEY)
+    if (saved !== null) return saved === '1'
+  } catch {
+    // Fall through to the viewport-aware default.
+  }
+
+  return window.matchMedia('(min-width: 1280px) and (max-width: 1599px)').matches
+}
+
 function toggleOutline(): void {
   collapsed.value = !collapsed.value
   applyState()
@@ -36,12 +47,7 @@ watch(
 )
 
 onMounted(async () => {
-  try {
-    collapsed.value = window.localStorage.getItem(STORAGE_KEY) === '1'
-  } catch {
-    collapsed.value = false
-  }
-
+  collapsed.value = readInitialState()
   applyState()
   await nextTick()
   refreshAvailability()

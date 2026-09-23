@@ -10,7 +10,14 @@ export default withMermaid(defineConfig({
   head: [
     ['meta', { name: 'theme-color', content: '#0b7f68' }],
     ['meta', { property: 'og:title', content: 'Eino 源码解析' }],
-    ['meta', { property: 'og:description', content: '从 API 到运行时，系统拆解 Eino 的实现' }]
+    ['meta', { property: 'og:description', content: '从 API 到运行时，系统拆解 Eino 的实现' }],
+    ['script', {}, `(function () {
+      try {
+        var saved = localStorage.getItem('eino-doc-outline-collapsed')
+        var useCompactDefault = saved === null && matchMedia('(min-width: 1280px) and (max-width: 1599px)').matches
+        if (saved === '1' || useCompactDefault) document.documentElement.classList.add('outline-collapsed')
+      } catch (_) {}
+    })()`]
   ],
   themeConfig: {
     logo: '/logo.svg',
@@ -73,6 +80,7 @@ export default withMermaid(defineConfig({
             { text: '最新源码校验报告', link: '/adk/latest-source-audit' },
             { text: 'ADK 图解总览', link: '/adk/visual-guide' },
             { text: '先理解这些概念', link: '/adk/beginner-concepts' },
+            { text: '小白推演：一次 Agent 请求', link: '/adk/zero-to-agent' },
             { text: 'Agent / Runner / ChatModelAgent', link: '/adk/roles-and-boundaries' },
             { text: 'Typed Agent 与 AgenticMessage', link: '/adk/typed-agent-agentic' },
             { text: '完整生命周期', link: '/adk/lifecycle' },
@@ -91,7 +99,10 @@ export default withMermaid(defineConfig({
           items: [
             { text: '事件与异步迭代器', link: '/adk/events' },
             { text: 'Runner 与运行上下文', link: '/adk/runner-context' },
+            { text: 'Runner 持久化读写链', link: '/adk/runner-persistence' },
+            { text: 'LLM 上下文窗口与消息存储', link: '/adk/context-window' },
             { text: 'Context 的逐层传播', link: '/adk/context-flow' },
+            { text: 'ADK 配置分层全景', link: '/adk/config-layers' },
             { text: 'Config 与 Option 转换', link: '/adk/config-option-flow' },
             { text: 'ChatModelAgent', link: '/adk/chat-model-agent' },
             { text: 'ReAct 图实现', link: '/adk/react' },
