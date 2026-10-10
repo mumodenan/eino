@@ -12,6 +12,10 @@ Workflow Agent 是 ADK 中负责**确定性控制流**的一组 Agent：
 
 它们不是另一套独立运行时。它们仍然实现 `Agent` / `ResumableAgent`，仍然接收 `AgentInput`、输出 `AgentEvent`，仍然由 `Runner` 驱动，也仍然使用 `runContext`、session history、Address、checkpoint 和 interrupt tree。特殊之处只在于：**普通 Agent 决定“做什么”，Workflow Agent 决定“下一个 Agent 何时运行”。**
 
+::: tip 配套 Demo
+建议先运行 [Demo 阶梯](./demo-ladder.md) 的 Demo 8，再阅读本章的 Sequential、Parallel、Loop 和 fork/join 细节。
+:::
+
 > 本章按源码真实执行顺序讲解。重点文件是 `adk/workflow.go`、`adk/flow.go`、`adk/runctx.go`、`adk/interrupt.go` 和 `adk/workflow_test.go`。
 
 ## 1. 先建立整体心智模型

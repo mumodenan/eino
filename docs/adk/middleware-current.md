@@ -11,6 +11,8 @@
 本页分析当前实现；[兼容版 Middleware 的完整执行机制](./middleware.md)仍保留，用于理解迁移期旧字段怎样被执行。
 :::
 
+配套的最小示例见 [Demo 阶梯](./demo-ladder.md) 的 Demo 6～7：先用 `BeforeModelRewriteState` 做机械裁剪，再对比 `reduction` 与 `summarization`。
+
 ## 1. 四个名字先分清
 
 “Middleware 新旧版本”最容易混淆，是因为 Eino 同时存在四个相近概念：

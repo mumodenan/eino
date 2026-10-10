@@ -4,6 +4,10 @@
 
 本章解释各类状态在源码中实际保存在哪里。如果你更关心“一个生产 Agent 应该怎样组装、长期记忆和 Summary 应该做成 Tool、Middleware 还是独立 Agent”，请配合阅读 [Agent 组装最佳实践](./agent-composition-best-practices.md)。
 
+::: tip 配套 Demo
+先运行 [Demo 阶梯](./demo-ladder.md) 的 Demo 1～3，再回来看本章的 `runSession`、`state` 和长期记忆边界。
+:::
+
 ```mermaid
 flowchart TB
     Long["Agent 实例生命周期<br/>model / instruction / tools / middleware"]

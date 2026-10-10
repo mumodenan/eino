@@ -2,6 +2,10 @@
 
 > 这一章回答一个很容易混淆的问题：**`ctx`、`session`、`state` 到底哪些会被持久化，在哪一层写入，又在哪一层读回？**
 
+::: tip 配套 Demo
+先看 [Demo 阶梯](./demo-ladder.md) 的 Demo 9：它用一个进程内 `CheckPointStore` 展示中断保存和恢复；生产环境只需要替换 Store 实现。
+:::
+
 先给结论：它们不是同一个对象，也不是每次执行都会自动落盘。
 
 ```mermaid

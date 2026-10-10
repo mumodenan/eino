@@ -74,62 +74,69 @@ export default withMermaid(defineConfig({
       ],
       '/adk/': [
         {
-          text: '从零理解 ADK',
+          text: '先看路线与总览',
           items: [
             { text: 'ADK 总览', link: '/adk/overview' },
-            { text: '最新源码校验报告', link: '/adk/latest-source-audit' },
+            { text: 'ADK 学习路线', link: '/adk/learning-path' },
+            { text: 'Demo 阶梯：从事件到恢复', link: '/adk/demo-ladder' },
             { text: 'ADK 图解总览', link: '/adk/visual-guide' },
+            { text: '最新源码校验报告', link: '/adk/latest-source-audit' }
+          ]
+        },
+        {
+          text: '主线：从一次请求开始',
+          items: [
             { text: '先理解这些概念', link: '/adk/beginner-concepts' },
             { text: '小白推演：一次 Agent 请求', link: '/adk/zero-to-agent' },
             { text: 'Agent / Runner / ChatModelAgent', link: '/adk/roles-and-boundaries' },
             { text: 'Typed Agent 与 AgenticMessage', link: '/adk/typed-agent-agentic' },
             { text: '完整生命周期', link: '/adk/lifecycle' },
             { text: '复杂请求端到端追踪', link: '/adk/end-to-end-trace' },
+            { text: 'LLM 上下文窗口与消息存储', link: '/adk/context-window' },
+            { text: '状态、历史与记忆', link: '/adk/state-and-memory' }
+          ]
+        },
+        {
+          text: '运行时骨架：Context 与持久化',
+          items: [
+            { text: 'Runner 与运行上下文', link: '/adk/runner-context' },
+            { text: 'Context 的逐层传播', link: '/adk/context-flow' },
+            { text: 'Runner 持久化读写链', link: '/adk/runner-persistence' },
+            { text: '中断、检查点与恢复', link: '/adk/interrupt-resume' },
+            { text: 'ADK 配置分层全景', link: '/adk/config-layers' },
+            { text: 'Config 与 Option 转换', link: '/adk/config-option-flow' }
+          ]
+        },
+        {
+          text: '组件深入：Agent、Middleware 与 Workflow',
+          items: [
             { text: '第一个可运行 Agent', link: '/adk/first-agent' },
             { text: '自定义 Agent 实战', link: '/adk/custom-agent' },
             { text: '执行阶段与组件选型', link: '/adk/component-positioning' },
             { text: 'Agent 组装最佳实践', link: '/adk/agent-composition-best-practices' },
-            { text: '状态、历史与记忆', link: '/adk/state-and-memory' },
-            { text: '初学者常见问题', link: '/adk/faq' },
-            { text: '术语与类型速查', link: '/adk/glossary' }
-          ]
-        },
-        {
-          text: '核心运行机制',
-          items: [
-            { text: '事件与异步迭代器', link: '/adk/events' },
-            { text: 'Runner 与运行上下文', link: '/adk/runner-context' },
-            { text: 'Runner 持久化读写链', link: '/adk/runner-persistence' },
-            { text: 'LLM 上下文窗口与消息存储', link: '/adk/context-window' },
-            { text: 'Context 的逐层传播', link: '/adk/context-flow' },
-            { text: 'ADK 配置分层全景', link: '/adk/config-layers' },
-            { text: 'Config 与 Option 转换', link: '/adk/config-option-flow' },
             { text: 'ChatModelAgent', link: '/adk/chat-model-agent' },
             { text: 'ReAct 图实现', link: '/adk/react' },
-            { text: 'Callback 与 AgentEvent', link: '/adk/callbacks' },
-            { text: '并发、取消与错误边界', link: '/adk/concurrency-errors' },
-            { text: 'Cancel 与 TurnLoop', link: '/adk/cancel-turn-loop' }
-          ]
-        },
-        {
-          text: '组合与控制流',
-          items: [
-            { text: 'Middleware 新旧 API', link: '/adk/middleware-current' },
-            { text: '兼容版 Middleware 源码', link: '/adk/middleware' },
+            { text: '新版 Middleware', link: '/adk/middleware-current' },
             { text: '内置 Middleware 源码', link: '/adk/builtin-middlewares' },
+            { text: 'Callback 与 AgentEvent', link: '/adk/callbacks' },
             { text: 'AgentTool 与转交', link: '/adk/tools-transfer' },
             { text: '工作流 Agent', link: '/adk/workflows' },
-            { text: 'Workflow 完整案例', link: '/adk/workflow-case-study' },
-            { text: '中断、检查点与恢复', link: '/adk/interrupt-resume' }
+            { text: 'Workflow 完整案例', link: '/adk/workflow-case-study' }
           ]
         },
         {
-          text: '预构建实现',
+          text: '执行细节与参考',
           items: [
+            { text: '事件与异步迭代器', link: '/adk/events' },
+            { text: '并发、取消与错误边界', link: '/adk/concurrency-errors' },
+            { text: 'Cancel 与 TurnLoop', link: '/adk/cancel-turn-loop' },
+            { text: '兼容版 Middleware', link: '/adk/middleware' },
             { text: 'Prebuilt 深入分析', link: '/adk/prebuilt' },
             { text: 'ADK 源码导读', link: '/adk/source-walkthrough' },
             { text: '调试与测试手册', link: '/adk/debugging-testing' },
-            { text: '模块覆盖审计', link: '/adk/coverage-audit' }
+            { text: '模块覆盖审计', link: '/adk/coverage-audit' },
+            { text: '初学者常见问题', link: '/adk/faq' },
+            { text: '术语与类型速查', link: '/adk/glossary' }
           ]
         }
       ],
