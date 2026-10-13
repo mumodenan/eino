@@ -1,66 +1,144 @@
 # Config 与 Option 的转换全链路
 
-::: warning Middleware 配置已演进
-当前主入口是 `Handlers []TypedChatModelAgentMiddleware[M]`；`Middlewares []AgentMiddleware` 仍保留兼容但已 Deprecated。下文同时解释“当前主链”和“旧字段如何继续被折叠”，迁移关系见 [Middleware 新旧 API](./middleware-current.md)。
+::: warning 先记住一个结论
+`Config`、`AgentRunOption`、`compose.Option`、`model.Option`、`tool.Option` 不是同一种“配置”。它们由不同对象创建，在不同时间生效，最后也由不同消费者读取。
+
+本章用一条真实请求把它们串起来：**构造 Agent → 创建 Runner → `Query` 传入 Option → flowAgent 过滤 → ChatModelAgent 提取 → compose Graph 分发 → Model/Tool 读取。**
+
+当前新版 Middleware 使用 `Handlers`；旧的 `Middlewares` 仍可兼容执行，但已经 Deprecated。详见 [Middleware 新旧 API](./middleware-current.md)。
 :::
 
-初学者阅读 Eino ADK 源码时，很容易把名字里的 `Config`、`Option`、`ToolsConfig`、`GraphCompileOption` 当成“都是配置”。它们的确都在影响行为，但处在完全不同的时间和层级。
+## 1. 先用四个问题分辨它们
 
-最先建立这张心智图：
+初学者不要先背字段名。看到任何 `Config` 或 `Option`，先问四件事：
+
+| 问题 | 要找的答案 | 例子 |
+| --- | --- | --- |
+| 谁创建？ | 应用、Runner、Agent、Graph 还是某个叶子组件 | 应用创建 `RunnerConfig`；ChatModelAgent 创建 `compose.Option` |
+| 什么时候生效？ | 构造期、首次运行、每次 Run、每次模型调用还是每次 Tool 调用 | `Handlers.BeforeAgent` 每次 Run；`model.WithTemperature` 每次模型调用 |
+| 谁读取？ | Runner、flowAgent、ChatModelAgent、Graph、Model、Tool | Runner 读取 `WithSessionValues`；Tool 读取自己的 `tool.Option` |
+| 变成什么？ | 字段、Context、Graph state、compose envelope 还是叶子参数 | `model.Option` 最终变成 provider 的 `Options` |
+
+一句话记忆：
+
+```text
+Config        = 这个长期对象是什么
+AgentRunOption= 这一次 Agent 怎么运行
+compose.Option= 这一次 Graph 如何分发运行参数
+model.Option  = 这一次模型调用怎么发
+tool.Option   = 这一次 Tool 调用怎么发
+State         = 下一轮模型和 Resume 依赖的运行状态
+ResumeParams  = 中断后从哪里、带什么数据继续
+```
+
+不要把“名字里都有 Option/Config”理解成“它们可以互换”。`model.WithTemperature` 不能放进 `ChatModelAgentConfig`，`tool.Option` 也不能用来新增 Tool。
+
+## 2. 一次请求的总链路
+
+下面这张图是本章唯一需要反复回看的主图。每个箭头都表示一次“换包装”或“挑选”：
 
 ```mermaid
 flowchart TB
-    subgraph Static["构造期：长期配置"]
-      RC["RunnerConfig"] --> RF["Runner fields"]
-      AC["TypedChatModelAgentConfig[M]"] --> NM["保存静态配置与 wrappers"]
-      NM --> BR["每次 Run: BeforeAgent → exec context"]
-    end
+    App["应用启动"] --> RC["RunnerConfig"]
+    App --> AC["TypedChatModelAgentConfig[M]"]
+    AC --> Agent["ChatModelAgent 长期对象"]
+    RC --> Runner["TypedRunner[M]"]
 
-    subgraph Runtime["调用期：一次请求"]
-      AO["AgentRunOption"] --> CO["ADK common options"]
-      AO --> CMO["ChatModelAgent options"]
-      CMO --> OP["compose.Option"]
-      OP --> MO["model.Option"]
-      OP --> TNO["ToolsNodeOption"]
-      TNO --> TO["tool.Option"]
-      TO --> IAO["AgentTool 内层 AgentRunOption"]
-    end
+    Query["Runner.Query / Run"] --> ARO["AgentRunOption..."]
+    ARO --> Common["ADK common options"]
+    ARO --> Named["按 Agent 名称过滤"]
+    Named --> CMA["ChatModelAgent 提取自己的 options"]
 
-    subgraph Restore["恢复期"]
-      CP["checkpoint"] --> RS["旧 runContext / Graph State"]
-      ID["interrupt ID → data"] --> RS
-      NO["本次新 options"] --> RS
-    end
+    CMA --> CMO["[]model.Option"]
+    CMA --> TO["[]tool.Option"]
+    CMO --> CO1["compose.WithChatModelOption"]
+    TO --> CO2["compose.WithToolsNodeOption"]
+    CO1 --> Compose["compose.Option envelope"]
+    CO2 --> Compose
+    Compose --> Graph["Graph.extractOption"]
+    Graph --> Model["ChatModel node"]
+    Graph --> Tools["ToolsNode"]
+    Model --> Provider["provider.GetCommonOptions"]
+    Tools --> Tool["具体 Tool.InvokableRun"]
+
+    Agent --> Build["首次构建稳定 run function"]
+    Build --> Before["每次 Run: BeforeAgent"]
+    Before --> Graph
 ```
 
-沿着箭头找最终消费者：Runner 不认识 temperature，ChatModel 不认识 session value，Tool 也不会读取 ChatModelAgentConfig。
+对应源码的关键事实是：
+
+1. `RunnerConfig` 和 `TypedChatModelAgentConfig` 在构造时保存到长期对象；
+2. `AgentRunOption` 从 `Query/Run/Resume` 进入，生命周期通常只覆盖一次运行；
+3. 同一份 `AgentRunOption` 会被多层尝试读取，每层只消费自己认识的函数类型；
+4. ChatModelAgent 把自己认识的运行选项转换成 `compose.Option`；
+5. Graph 再按节点类型和 `NodePath` 将 envelope 分发给 Model 或 ToolsNode；
+6. 只有到了叶子组件，`model.Option` 或 `tool.Option` 才会变成真正的模型/工具参数。
+
+## 3. 生命周期地图：每一类对象活多久
+
+| 层级 | 典型类型 | 创建时间 | 主要生命周期 | 最终消费者 |
+| --- | --- | --- | --- | --- |
+| Runner | `RunnerConfig` / `TypedRunnerConfig[M]` | 应用启动 | Runner 复用期间 | `TypedRunner` |
+| Agent | `TypedChatModelAgentConfig[M]` | 应用启动 | Agent 复用期间 | ChatModelAgent |
+| Tool 拓扑 | `ToolsConfig` / `compose.ToolsNodeConfig` | Agent 构造 | Agent 配置期间 | ReAct / ToolsNode |
+| Middleware | `Handlers`、旧 `Middlewares` | Agent 构造 | Agent 复用；方法在运行时执行 | state/model/tool wrapper |
+| 单次运行 | `AgentRunOption` | 每次 `Run/Query/Resume` | 一次运行或一次恢复 | Runner、flowAgent、具体 Agent |
+| Graph 编译 | `GraphCompileOption` | `Chain.Compile` | 编译出的 Runnable 生命周期 | compose Graph |
+| 模型调用 | `model.Option` | 每次 `Generate/Stream` 前 | 一次模型调用 | Model/provider |
+| Tool 调用 | `tool.Option` | 每次 `InvokableRun/StreamableRun` 前 | 一次 Tool 调用 | 具体 Tool |
+| 运行状态 | `runSession`、Graph state、`state.Messages` | Run 时创建 | 当前 Run，可被 checkpoint | 下一轮、Resume |
+| 恢复参数 | `ResumeParams`、`ChatModelAgentResumeData` | `Resume*` 调用 | 一次恢复 | Runner、interrupt、Graph state |
+
+两个边界必须记牢：
+
+- `ChatModelAgentConfig` 可以被复用，但不应该把本次对话的消息放进 Config；消息属于 `AgentInput` 和 Graph state。
+- `AgentRunOption` 可以每次不同，但不会永久修改 Agent 的 Config。
+
+## 4. 可运行 Demo：先看输出，再读转换
+
+仓库新增了一个不依赖外部 API Key 的完整示例：
 
 ```text
-创建期（长期保留）
-RunnerConfig ─────→ Runner 字段
-TypedChatModelAgentConfig[M] ─→ TypedChatModelAgent 字段
-                                  │ 每次 Run 准备 exec context
-                                  ├─ Handlers.BeforeAgent 动态改 instruction/tools
-                                  ├─ classic Message：无工具链或 ReAct
-                                  └─ AgenticMessage：agentic model chain
-
-编译期（生成 Runnable）
-GraphCompileOption ───→ graph name / state / checkpoint / max steps ...
-
-每次调用（短期）
-AgentRunOption
-   ├─ ADK 通用选项 → Runner / flowAgent 直接消费
-   └─ ChatModelAgent 选项
-          ↓ getComposeOptions
-       compose.Option
-          ├─ ChatModel node → []model.Option
-          ├─ ToolsNode       → ToolsNodeOption → []tool.Option
-          └─ Graph runtime  → callback / state modifier / checkpoint ID
+docs/examples/adk-config-options/main.go
 ```
 
-一句话区分：**Config 决定“这个 Agent 是什么”，RunOption 决定“这一次怎么跑”，CompileOption 决定“图编译成什么样的 Runnable”。**
+在仓库根目录运行：
 
-## 一、RunnerConfig 几乎是直接映射
+```bash
+go run ./docs/examples/adk-config-options
+```
+
+下面直接嵌入完整源码。文档和仓库中的 `.go` 文件使用同一份内容，读者可以先在页面里阅读，再复制命令运行；后续修改示例文件时，页面会自动显示最新版本。
+
+### 完整 Demo 源码
+
+<<< @/examples/adk-config-options/main.go
+
+它使用一个 fake model 和一个 fake tool，把四个结果打印出来：
+
+```text
+MODEL: system="你是 小明 的订单助手" temperature=0.2 tools=1
+TOOL: user=小明 prefix="查询结果：" args={"id":"A100"}
+MODEL: system="你是 小明 的订单助手" temperature=0.2 tools=1
+EVENT: 最终回答：查询结果：订单 A100 已发货
+```
+
+这个输出本身就是转换链的证据：
+
+| 输出 | 证明了什么 | 来自哪里 |
+| --- | --- | --- |
+| `小明` 出现在 system message | Session Value 没有直接改模型，而是在 `GenModelInput` 中格式化 instruction | `WithSessionValues` → `runSession.Values` → `defaultGenModelInput` |
+| `temperature=0.2` | ChatModelAgent 运行选项已经到达 Model provider | `WithChatModelOptions` → `compose.WithChatModelOption` → `model.GetCommonOptions` |
+| `tools=1` | 静态 ToolsConfig 生成了本次模型可见的 ToolInfo | `ToolsConfig` → `execContext` → `model.WithTools` |
+| `prefix="查询结果："` | Tool option 穿过了 ToolsNode，最终到达具体 Tool | `WithToolOptions` → `ToolsNodeOption` → `tool.GetImplSpecificOptions` |
+| 模型调用两次 | 第一次产生 ToolCall，Tool 执行后 ReAct 回到 Model | `ChatModelAgent` 的 ReAct Graph |
+
+这段 Demo 的完整代码还演示了一个容易遗漏的点：`WithChatModelOptions` 可以用 `DesignateAgent("order_assistant")` 限定只给指定 Agent；`WithToolOptions` 如果没有指定 Agent，则会继续随 Agent 树传播到能识别它的 ChatModelAgent。
+
+## 5. 第一层：RunnerConfig 如何落到 Runner
+
+源码入口：`adk/runner.go`。
 
 ```go
 type RunnerConfig struct {
@@ -70,184 +148,213 @@ type RunnerConfig struct {
 }
 ```
 
-`NewRunner` 没有复杂的转换，它把三个字段直接存入 `Runner`：
+`NewRunner` 基本是直接映射：
 
-| Config 字段 | Runner 字段 | 何时消费 |
+| Config 字段 | Runner 中保存的字段 | 何时消费 |
 | --- | --- | --- |
 | `Agent` | `a` | 每次 Run/Resume 时包成 flowAgent |
-| `EnableStreaming` | `enableStreaming` | Run 时写入 `AgentInput.EnableStreaming` |
-| `CheckPointStore` | `store` | 中断时保存、Resume 时读取 |
+| `EnableStreaming` | `enableStreaming` | `Run` 时写入 `AgentInput.EnableStreaming` |
+| `CheckPointStore` | `store` | 中断保存、Resume 读取 |
 
-`checkPointID` 不在 `RunnerConfig` 里，因为它通常属于某一次请求，由运行 Option 提供。Store 是长期依赖，ID 是本次实例标识，两者不应该混在同一个生命周期。
+`checkPointID` 不在 `RunnerConfig` 中，而是由 `WithCheckPointID` 作为一次运行选项提供。这样同一个 Runner 可以服务多个会话：Store 是长期依赖，checkpoint ID 是一次运行的实例标识。
 
-## 二、ChatModelAgentConfig 先被“归一化”
+```go
+runner := adk.NewRunner(ctx, adk.RunnerConfig{
+    Agent:           agent,
+    EnableStreaming: true,
+    CheckPointStore: store,
+})
 
-`NewChatModelAgent` 是经典消息入口，内部调用 `NewTypedChatModelAgent[*schema.Message]`。它要求 Model 非 nil，并将 Config 归一化为 Agent 的稳定字段；Name/Description 独立运行可为空，包装为 AgentTool 时才要求非空。
+iter := runner.Query(ctx, "你好",
+    adk.WithCheckPointID("conversation-001"),
+)
+```
+
+此时还没有把 `WithCheckPointID` 交给 Model 或 Tool；Runner 先在 ADK common options 中读取它，用于外层 checkpoint 处理。
+
+## 6. 第二层：ChatModelAgentConfig 如何变成长期 Agent
+
+### 6.1 构造器做什么
+
+`NewChatModelAgent` 是经典 `*schema.Message` 的便利入口，内部调用泛型构造器：
 
 ```go
 type TypedChatModelAgentConfig[M MessageType] struct {
-    Name             string
-    Description      string
-    Instruction      string
-    Model            model.BaseModel[M]
-    ToolsConfig      ToolsConfig
-    GenModelInput    TypedGenModelInput[M]
-    Exit             tool.BaseTool
-    OutputKey        string
-    MaxIterations    int
-    Handlers         []TypedChatModelAgentMiddleware[M]
-    ModelRetryConfig *TypedModelRetryConfig[M]
+    Name                string
+    Description         string
+    Instruction         string
+    Model               model.BaseModel[M]
+    ToolsConfig         ToolsConfig
+    GenModelInput       TypedGenModelInput[M]
+    Exit                tool.BaseTool
+    OutputKey           string
+    MaxIterations       int
+    Handlers            []TypedChatModelAgentMiddleware[M]
+    ModelRetryConfig    *TypedModelRetryConfig[M]
     ModelFailoverConfig *ModelFailoverConfig[M]
-    Middlewares      []AgentMiddleware // Deprecated
+    Middlewares         []AgentMiddleware // Deprecated
 }
 ```
 
-### 当前 Handler 在运行期展开
+构造器会：
 
-构造器只保存 Handlers。第一次 Run/Resume 时，`buildRunFunc` 在 `sync.Once` 中调用 `prepareExecContext`，生成并缓存包含静态 instruction/tools、隐式 transfer/exit tool、兼容 Middleware 和 ToolInfo 的基准 `execContext`。此后**每次** Run/Resume，`getRunFunc` 都从该基准调用 `applyBeforeAgent`：复制本次 instruction/tools/ReturnDirectly，按顺序执行 Handlers，再重新生成本次 ToolInfo。因而动态行为来自 `applyBeforeAgent`，不是反复执行 `prepareExecContext`。
+1. 检查 Model 是否为空；
+2. 没有自定义 `GenModelInput` 时选择默认实现；
+3. 复制 ToolsConfig 中的工具和 Tool middleware；
+4. 给 Tool 链加入默认 event sender 和 cancel monitor；
+5. 保存 instruction、model、handlers、旧 middlewares、重试和 failover 配置；
+6. **不立即执行模型，也不立即建立每次运行的 session。**
 
-每个模型轮次再执行 state hooks 与 model wrappers；Tool wrappers 则在真实端点周围执行。Handlers 不是创建期被拆成几个静态 slice 的旧模型。
+因此下面的代码只是在创建长期对象：
 
-### 兼容 Middleware 仍会按能力进入不同阶段
-
-每个 `AgentMiddleware` 可同时携带四类扩展：附加 instruction、附加 tools、模型前后 hooks、tool-call wrapper。当前实现不是在构造器中一次性拆成五个永久 slice，而是在不同时间读取这些字段：
-
-```text
-构造 NewTypedChatModelAgent
-  Middlewares[i].WrapToolCall
-    → 收集并追加到 ToolCallMiddlewares
-
-首次 prepareExecContext（sync.Once）
-  Middlewares[i].AdditionalInstruction
-    → 基准 instruction 字符串追加
-  Middlewares[i].AdditionalTools
-    → 基准真实 Tools 追加
-
-每次 typedStateModelWrapper.Generate / Stream（仅经典 Message）
-  Middlewares[i].BeforeChatModel
-    → 新 BeforeModelRewriteState 之前
-  Middlewares[i].AfterChatModel
-    → 新 AfterModelRewriteState 之后
+```go
+agent, err := adk.NewChatModelAgent(ctx, &adk.ChatModelAgentConfig{
+    Name:        "assistant",
+    Description: "订单助手",
+    Instruction: "你是 {User} 的订单助手",
+    Model:       chatModel,
+    ToolsConfig: adk.ToolsConfig{
+        ToolsNodeConfig: compose.ToolsNodeConfig{Tools: tools},
+    },
+    Handlers: []adk.ChatModelAgentMiddleware{handler},
+})
 ```
 
-这表明旧 Middleware 不是 `AgentRunOption`：它仍属于 Agent 的长期配置。两个旧 model hook 会按每轮调用读取，但在 AgenticMessage 路径上不执行；完整兼容行为见 [兼容版 Middleware](./middleware.md)。
+### 6.2 首次 Run 与后续 Run 的区别
 
-### GenModelInput 的默认值
-
-如果没传 `GenModelInput`，会使用 `defaultGenModelInput`：
-
-1. 有 instruction 时构造 system message；
-2. 读取 session values；
-3. 用 f-string 替换 `{User}` 这类占位符；
-4. 将原 `AgentInput.Messages` 追加在 system message 后。
-
-因此 session value 不是被 Runner 直接改写到 prompt，而是到 `GenModelInput` 这一层才被读取和格式化。
-
-## 三、为什么可执行结构要到 Run 时才能确定
-
-Agent 在构造后还可以建立父子关系；更重要的是，新版 `BeforeAgent` 每次运行都可能改变 Instruction 和真实 Tool 集。所以静态 Config 并不足以提前决定“本次是否有 Tool”和本次 ToolInfo。
-
-每次执行准备阶段会做以下转换（底层仍复用稳定 run function 框架）：
+ChatModelAgent 不是每次都从 Config 重新完整构造。源码分成两段：
 
 ```text
-ChatModelAgent 稳定字段
-   ├─ copy instruction
-   ├─ copy ToolsNodeConfig
-   ├─ copy ReturnDirectly map
-   ├─ 有可转交 Agent：加 transfer instruction + transfer tool
-   ├─ 有 Exit：加 exit tool + ReturnDirectly
-   ├─ BeforeAgent handlers 修改本次配置
-   └─ 按本次最终 tools 数量分支
-        ├─ 0 个：简单 Chain
-        └─ >0 个：reactConfig → newReact
+第一次 Run/Resume
+  → sync.Once
+  → prepareExecContext
+  → 保存基准 instruction / tools / ReturnDirectly / ToolInfo
+  → buildRunFunc
+  → 无工具：Chain；有工具：ReAct Graph
+
+每次 Run/Resume
+  → 从基准 execContext 复制一份
+  → applyBeforeAgent
+  → 本次 handlers 修改 instruction / tools / ReturnDirectly
+  → 必要时重建 Graph
+  → 读取本次 AgentRunOption
+  → 执行
 ```
 
-注意：用户没配置普通 Tool，也不一定走“无工具”分支。只要有可 Transfer 的 Agent 或 `Exit`，构建阶段就会注入工具，最后仍然走 ReAct。
+这解释了两个看似矛盾的事实：
 
-父子关系仍应在第一次 Run 前完成；但不要由此误推断 Handlers 只能静态修改工具。`BeforeAgent` 的设计目的正是每次 Run 动态装配。
+- Config 是长期配置，构造后不应该通过修改原 Config 动态改变 Agent；
+- 新版 Handler 的 `BeforeAgent` 又确实可以每次运行动态改变工具和 instruction。
 
-## 四、ToolsConfig 到 ToolsNodeConfig 的转换
+动态改变发生在“本次运行的复制品”上，而不是改写长期 Agent。
 
-ADK 的 `ToolsConfig` 是对 compose 的一层扩展：
+## 7. ToolsConfig：静态拓扑，不是单次 Tool 参数
 
 ```go
 type ToolsConfig struct {
     compose.ToolsNodeConfig
-    ReturnDirectly   map[string]bool
+    ReturnDirectly     map[string]bool
     EmitInternalEvents bool
 }
 ```
 
-`compose.ToolsNodeConfig` 主要包含：
+### 7.1 `compose.ToolsNodeConfig` 的职责
 
-- `Tools`：实际工具列表；
-- `UnknownToolsHandler`：模型请求不存在的工具时如何处理；
-- `ExecuteSequentially`：多 tool call 是顺序还是并行；
-- `ToolArgumentsHandler`：调用前改写 arguments；
-- `ToolCallMiddlewares`：包装 invokable/streamable tool call。
+它描述 ToolsNode 的长期能力和拓扑：
 
-ADK 新增的两个字段不属于普通 ToolsNode 能理解的语义：
+- `Tools`：实际的 Tool 列表；
+- `UnknownToolsHandler`：模型请求未知工具时的处理；
+- `ExecuteSequentially`：多个 Tool call 顺序或并行；
+- `ToolArgumentsHandler`：调用前改写 JSON arguments；
+- `ToolCallMiddlewares`：包裹 Tool endpoint。
 
-- `ReturnDirectly`：决定 ReAct 分支在某工具返回后直接 END，还是回到 ChatModel；
-- `EmitInternalEvents`：决定 AgentTool 的内部事件是否转发到外层 generator。
+### 7.2 ADK 额外字段的职责
 
-因此 `buildRunFunc` 会将嵌入的 `ToolsNodeConfig` 交给 `reactConfig`，将 `ReturnDirectly` 单独交给 ReAct 的分支判定，将 `EmitInternalEvents` 留到每次 Run 时注入 Tool Option。
+- `ReturnDirectly`：某个 Tool 成功后是否直接结束 ReAct，而不是回到模型；
+- `EmitInternalEvents`：AgentTool 子 Agent 的内部事件是否向外层 generator 转发。
 
-## 五、reactConfig 如何变成 Graph
-
-经典 Message 路径的执行配置是 ChatModelAgent 与 compose Graph 之间的桥；AgenticMessage 路径则不构建同等的 ToolsNode ReAct 循环：
+构造时它们会进入 `execContext` 或 ReAct 配置；运行时 `EmitInternalEvents` 还会被转换成一次性的 Tool option。它们都不是 `WithToolOptions` 的替代品。
 
 ```text
-reactConfig
-  ├─ model
-  ├─ *ToolsNodeConfig
-  ├─ toolsReturnDirectly
-  ├─ maxIterations
-  ├─ old before/after hooks + current handlers
-  ├─ retry / failover / cancel
-  └─ model and tool event senders
-          ↓ newReact
-  Graph[[]Message, Message]
-  START → ChatModel → (有 tool calls?) → ToolsNode → ChatModel
-                       └─ (直返/无调用) → END
+ToolsConfig.Tools
+  → 静态 Tool 拓扑
+  → genToolInfos
+  → model.WithTools(ToolInfo...)
+
+WithToolOptions(...)
+  → 本次 Tool 调用参数
+  → 不增加 Tool，不改变模型可见 ToolInfo
 ```
 
-`newReact` 的关键转换包括：
+## 8. Handlers 与旧 Middlewares 在哪一层生效
 
-1. 建立 Graph state generator；`MaxIterations <= 0` 时默认剩余 20 次；
-2. 遍历本次最终工具并调用 `Info(ctx)`，生成模型可读的 `ToolInfo`；
-3. 组织 failover → retry → event sender → Handler WrapModel → callback injection 链；
-4. 通过 model options 把 ToolInfos 传给模型；
-5. 在用户 Tool wrappers 外放置默认 event sender，并加入流式取消监控；
-6. `NewToolNode` 将普通/流式/Enhanced 四类 middleware 绑定到端点，并为可转换模式做适配；
-7. 建立 ChatModel 与 ToolsNode 之间的条件边。
+### 8.1 新版 Handlers
 
-这时得到的还是 Graph 定义。真正的 runnable 是在 run closure 中构建外层 Chain 并 Compile 得到的。
+新版 Handler 同时拥有多个生命周期方法，但不要把它们看成构造时拆开的配置字段：
 
-## 六、GraphCompileOption 不是 AgentRunOption
+```text
+BeforeAgent
+  → 每次 Run 前读取本次 ChatModelAgentContext
+  → 可以修改 Instruction / Tools / ReturnDirectly
 
-ChatModelAgent 构造 runnable 时使用的编译配置包括：
+BeforeModelRewriteState
+  → 每次模型调用前读取 state.Messages / ToolInfos
+  → 可以返回改写后的 state 和 Context
 
-```go
-compose.WithGraphName(a.name)
-compose.WithCheckPointStore(store)
-compose.WithSerializer(&gobSerializer{})
-compose.WithMaxRunSteps(math.MaxInt)
+WrapModel
+  → 包裹真正的 Model.Generate / Stream
+
+WrapToolCall
+  → 包裹真正的 Tool endpoint
+
+AfterModelRewriteState
+  → 模型调用后改写 Graph state
+
+AfterAgent
+  → 当前 Agent 完成后读取最终 state
 ```
 
-| CompileOption | 作用 |
-| --- | --- |
-| GraphName | 设定 runnable 名称，也影响 Address/callback 信息 |
-| CheckPointStore | 为 compose 图提供 checkpoint 存储 |
-| Serializer | 序列化 Graph state，ADK 使用 gob bridge |
-| MaxRunSteps | 图执行步数上限 |
-| GenLocalState | 创建 Graph 局部 state，通常在 NewGraph/NewChain 时设定 |
+所以 `Handlers` 是长期挂载在 Agent 上的能力；方法是在运行阶段执行。
 
-ReAct 自己用 remaining iterations 控制 Agent 迭代。外层 compose 的 `MaxRunSteps` 被设成 `math.MaxInt`，是为了避免 compose 的通用步数限制比 ADK 的迭代语义更早截断执行。
+### 8.2 旧版 Middlewares
 
-CompileOption 在构建 runnable 时消费；`AgentRunOption` 则是每个请求都可以不同。不要为了给单次调用设置 temperature 而重新 Compile Graph。
+旧 `AgentMiddleware` 仍按不同阶段读取：
 
-## 七、AgentRunOption 是怎么同时被多层“挑选”的
+```text
+AdditionalInstruction / AdditionalTools
+  → prepareExecContext：加入基准 instruction / tools
+
+BeforeChatModel / AfterChatModel
+  → 每轮经典 Message 模型调用前后
+
+WrapToolCall
+  → 构造时收集到 ToolCallMiddlewares
+```
+
+旧 API 不等于 `AgentRunOption`，也不会因为放进 `Middlewares` 就变成每次运行动态配置。新项目应使用 `Handlers`，旧字段只用于迁移和理解历史代码。
+
+## 9. 第三层：同一份 AgentRunOption 为什么能被多层读取
+
+这一节是整章最容易被一句话带过、但也是最容易误解的地方。先纠正一个直觉：
+
+```text
+不是：
+opts → Runner 取走 → ChatModelAgent 再取剩下的 → compose 再取剩下的
+
+而是：
+同一份 opts
+  ├─ Runner 读取自己认识的部分
+  ├─ flowAgent 按名称筛掉不可见的部分
+  ├─ ChatModelAgent 读取自己认识的部分
+  ├─ 自定义 Agent 读取自己认识的部分
+  └─ 每一层通常都不会修改原 opts，也不会把已读 Option 删除
+```
+
+可以把它想象成一叠写有不同收件人的信封。每个部门都拿到这叠信：只拆自己能识别的信封，其余原样放回，继续交给下一层。
+
+### 9.1 `AgentRunOption` 里面究竟装了什么
+
+源码中的容器非常小：
 
 ```go
 type AgentRunOption struct {
@@ -256,280 +363,649 @@ type AgentRunOption struct {
 }
 ```
 
-它里面的 `implSpecificOptFn` 故意是 `any`。一个 Option 通过 `WrapImplSpecificOptFn(func(*T))` 包装某种确切类型的修改函数。消费者用 `GetImplSpecificOptions[T]` 尝试类型断言：
+它不是一个包含 `sessionValues`、`temperature`、`toolOptions`、`ruleOptions` 的大结构体。每个 Option 实际上只保存两样东西：
+
+1. 一个可选的“修改函数”；
+2. 一个可选的 Agent 名称白名单。
 
 ```go
-optFn, ok := opt.implSpecificOptFn.(func(*T))
-if ok {
-    optFn(base)
+func WrapImplSpecificOptFn[T any](optFn func(*T)) AgentRunOption {
+    return AgentRunOption{
+        implSpecificOptFn: optFn,
+    }
 }
 ```
 
-因此同一个 `[]AgentRunOption` 可以穿过多层，每层只消费自己认识的函数类型：
-
-```text
-WithSessionValues       → func(*adk.options)               ADK 通用层认识
-WithCallbacks           → func(*adk.options)               Agent callback 层认识
-WithCancel              → func(*adk.options)               可取消执行层认识
-WithChatModelOptions    → func(*chatModelAgentRunOptions)  ChatModelAgent 认识
-自定义 Agent Option     → func(*MyAgentOptions)             只有自定义 Agent 认识
-```
-
-不匹配的 Option 不会报错，只是对该消费者无效。这个机制实现了“一条 Option 列表通过异构 Agent 树传播”，但也意味着自定义 Option 的泛型类型写错时可能会静默不生效。
-
-### DesignateAgent 再做一层可见性过滤
+例如下面三个 Option，表面上都是 `AgentRunOption`，但 `implSpecificOptFn` 里面的动态函数类型不同：
 
 ```go
-opt := adk.WithChatModelOptions(...).DesignateAgent("researcher")
+WithSessionValues(...)
+    // func(*adk.options)
+
+WithChatModelOptions(...)
+    // func(*chatModelAgentRunOptions)
+
+WithRuleLocale(...)
+    // func(*RuleRunOptions)
 ```
 
-`flowAgent.Run` 在调用具体 Agent 前执行 `filterOptions(agentName, opts)`：
+`any` 只是让它们能够放进同一个容器；它不会把三个结构体的字段合并，也不会自动做字段映射。
 
-- `agentNames` 为空：所有 Agent 可见；
-- 包含当前 Agent 名：可见；
-- 否则：不传给当前具体 Agent。
+### 9.2 为什么“按类型取出”能工作
 
-Runner 在此之前已经用原始 opts 读取 ADK common options。所以需要区分“Runner 对 Option 的消费”与“具体 Agent 的可见性”。
+消费者使用泛型函数取 Option：
+
+```go
+func GetImplSpecificOptions[T any](base *T, opts ...AgentRunOption) *T {
+    if base == nil {
+        base = new(T)
+    }
+    for _, opt := range opts {
+        if opt.implSpecificOptFn == nil {
+            continue
+        }
+        optFn, ok := opt.implSpecificOptFn.(func(*T))
+        if ok {
+            optFn(base)
+        }
+    }
+    return base
+}
+```
+
+关键在这句：
+
+```go
+opt.implSpecificOptFn.(func(*T))
+```
+
+这是 Go 的**精确动态类型断言**，不是“只要字段相似就能转换”。
+
+```text
+func(*adk.options)              ≠ func(*chatModelAgentRunOptions)
+func(*RuleRunOptions)           ≠ func(*OtherRuleRunOptions)
+```
+
+所以：
+
+- 类型相同：断言成功，执行函数，修改当前消费者自己的 `base`；
+- 类型不同：断言失败，跳过，不报错；
+- Option 本身没有被删除，也没有被修改；
+- 每个消费者通常传入自己的 `base`，因此互相不会看到对方的字段。
+
+这里的“静默忽略”是设计结果，不是异常路径。它让一份 options 可以穿过异构 Agent 树，但也带来一个代价：自定义 Option 的目标类型写错，可能表现为“不生效但不报错”。
+
+### 9.3 用同一份 opts 做一次完整推演
+
+假设调用方写了下面的代码：
+
+```go
+opts := []adk.AgentRunOption{
+    adk.WithSessionValues(map[string]any{"User": "小明"}),
+    adk.WithChatModelOptions(
+        []model.Option{model.WithTemperature(0.2)},
+    ),
+    adk.WithToolOptions(
+        []tool.Option{withLookupPrefix("查询结果：")},
+    ),
+    WithRuleLocale("zh-CN"),
+}
+
+iter := runner.Run(ctx, messages, opts...)
+```
+
+这四个元素在内存里大致是：
+
+| `opts` 元素 | 内部函数的动态类型 | 名称限制 | 谁应该读取 |
+| --- | --- | --- | --- |
+| `WithSessionValues` | `func(*adk.options)` | 无 | Runner / flowAgent common runtime |
+| `WithChatModelOptions` | `func(*chatModelAgentRunOptions)` | 无或指定 Agent | ChatModelAgent |
+| `WithToolOptions` | `func(*chatModelAgentRunOptions)` | 无或指定 Agent | ChatModelAgent |
+| `WithRuleLocale` | `func(*RuleRunOptions)` | 无或指定 Agent | RuleAgent |
+
+#### 第 1 站：Runner 读取 common options
+
+`TypedRunner.Run` 首先调用：
+
+```go
+o := getCommonOptions(nil, opts...)
+```
+
+它实际只寻找 `func(*adk.options)`：
+
+```text
+WithSessionValues       → 匹配，写入 o.sessionValues
+WithChatModelOptions    → 不匹配，跳过
+WithToolOptions         → 不匹配，跳过
+WithRuleLocale           → 不匹配，跳过
+```
+
+接下来 Runner 创建本次 `runContext/runSession`，把 `o.sessionValues` 写入 `runSession.Values`。**Runner 没有把另外三个 Option 删除。** 它仍然把原始 `opts` 传给后面的 flowAgent。
+
+#### 第 2 站：flowAgent 按 Agent 名称过滤
+
+如果所有 Option 都没有 `DesignateAgent`，当前 Agent 都能看到它们；如果某项带了名称限制，则先做可见性过滤：
+
+```text
+当前 Agent 名 = "order_assistant"
+
+WithChatModelOptions(...).DesignateAgent("researcher")
+  → 被 filterOptions 丢弃
+
+WithRuleLocale("zh-CN").DesignateAgent("rule_agent")
+  → 被丢弃
+
+WithSessionValues(...)
+  → 没有名称限制，保留
+```
+
+注意：`filterOptions` 只检查 `agentNames`，不检查 `implSpecificOptFn` 的类型。类型匹配是在具体 Agent 内部才发生的。
+
+#### 第 3 站：ChatModelAgent 读取自己的 options
+
+ChatModelAgent 调用：
+
+```go
+runOpts := GetImplSpecificOptions[chatModelAgentRunOptions](nil, filteredOpts...)
+```
+
+结果是一个新的 `chatModelAgentRunOptions`：
+
+```text
+chatModelOptions = [model.WithTemperature(0.2)]
+toolOptions      = [withLookupPrefix("查询结果：")]
+agentToolOptions = nil
+historyModifier  = nil
+```
+
+它不会得到 `sessionValues`，因为 `func(*adk.options)` 不是 `func(*chatModelAgentRunOptions)`；也不会得到 `RuleRunOptions`。
+
+然后 ChatModelAgent 将自己的两个字段换成 compose envelope：
+
+```text
+chatModelOptions
+  → compose.WithChatModelOption
+
+toolOptions
+  → compose.WithToolsNodeOption(compose.WithToolOption(...))
+```
+
+#### 第 4 站：自定义 RuleAgent 读取自己的 options
+
+如果同一棵 Agent 树中还有一个自定义 `RuleAgent`，它会这样读取：
+
+```go
+ruleOpts := adk.GetImplSpecificOptions(&RuleRunOptions{
+    Locale: "zh-CN",
+}, filteredOpts...)
+```
+
+结果只有 `WithRuleLocale` 会修改它：
+
+```text
+Strict = false          // 没有对应 Option，保留默认值
+Locale = "zh-CN"       // WithRuleLocale 写入
+```
+
+它看不到 ChatModelAgent 的 `chatModelOptions`，也不需要知道 `compose.Option` 的存在。
+
+#### 第 5 站：Graph 和叶子组件继续读取
+
+ChatModelAgent 产生的 `compose.Option` 进入 Graph 后，才继续分发：
+
+```text
+compose.WithChatModelOption(model.WithTemperature(0.2))
+  → ChatModel node
+  → provider 的 model.GetCommonOptions
+  → Options.Temperature = 0.2
+
+compose.WithToolsNodeOption(compose.WithToolOption(withLookupPrefix(...)))
+  → ToolsNode
+  → lookupOrder.InvokableRun(..., opts...)
+  → tool.GetImplSpecificOptions[lookupOptions]
+  → Prefix = "查询结果："
+```
+
+完整路径不是“一个 Option 被所有层共同修改”，而是：
+
+```text
+同一 opts slice
+  ├─ common Option → Runner 写入 runSession
+  ├─ ChatModel Option → ChatModelAgent 换成 compose.Option → Model
+  ├─ Tool Option → ChatModelAgent 换成 ToolsNodeOption → Tool
+  └─ Rule Option → RuleAgent 写入自己的 RuleRunOptions
+```
+
+### 9.4 用一张图理解“同一份 opts，不同的本地视图”
 
 ```mermaid
 flowchart TB
-    Call["Runner.Run(ctx, messages, opts...)"] --> Common["getCommonOptions<br/>session / callback / cancel / checkpoint"]
-    Call --> RootFlow["root flowAgent.filterOptions(root)"]
-    RootFlow --> RootAgent["root Agent<br/>只消费自己认识的 func(*T)"]
-    RootAgent --> ChildFlow["child flowAgent.filterOptions(child)"]
-    ChildFlow --> ChildAgent["child Agent<br/>再次按类型消费"]
+    Call["runner.Run(ctx, messages, opts...)"] --> Raw["同一份 []AgentRunOption\n不会按读取顺序被消耗"]
 
-    O1["WithSessionValues"] -. "Runner 消费；仍可继续传递" .-> Common
-    O2["WithChatModelOptions<br/>DesignateAgent(researcher)"] -. "只有名称匹配时可见" .-> ChildFlow
-    O3["自定义 func(*MyOptions)"] -. "只有 MyAgent 类型匹配" .-> ChildAgent
+    Raw --> Common["Runner.getCommonOptions\n目标类型: func(*adk.options)"]
+    Common --> Session["sessionValues\ncheckPointID\ncallbacks / cancel"]
+
+    Raw --> Flow["flowAgent.filterOptions\n只按 agentNames 做可见性过滤"]
+    Flow --> CMA["ChatModelAgent\n目标类型: func(*chatModelAgentRunOptions)"]
+    CMA --> Compose["compose.Option\n按 Graph 节点分发"]
+    Compose --> Model["ChatModel node\nmodel.Option"]
+    Compose --> Tools["ToolsNode\ntool.Option"]
+
+    Flow --> Custom["RuleAgent\n目标类型: func(*RuleRunOptions)"]
+    Custom --> RuleState["RuleAgent 自己的本地配置\nStrict / Locale"]
+
+    Wrong["func(*OtherOptions)"] -. "类型断言失败\n静默忽略" .-> Common
+    Wrong -. "类型断言失败\n静默忽略" .-> CMA
+    Wrong -. "类型断言失败\n静默忽略" .-> Custom
 ```
 
-<p class="diagram-caption">同一份 AgentRunOption 列表会被多层查看：先按 Agent 名过滤，再按内部函数的确切类型挑选；不匹配通常是静默忽略。</p>
+图中最重要的是 `Raw`：它不是一个“已经被 Runner 消费空”的队列，而是同一份只读选项列表。每层只是创建自己的本地结果对象。
 
-## 八、getComposeOptions：ADK 到 compose 的正式边界
+### 9.5 自定义 Agent Option 的完整最小写法
 
-ChatModelAgent 认识的每次运行配置是：
+假设你写了一个只负责规则校验的 Agent，不希望它知道 ChatModelAgent 的配置：
+
+下面代码省略了 import 块；完整可运行的事件迭代器写法可参见[第一个可运行 Agent](./first-agent.md)。这里故意把重点放在 Option 的定义、过滤和读取。
 
 ```go
-type chatModelAgentRunOptions struct {
-    chatModelOptions []model.Option
-    toolOptions      []tool.Option
-    agentToolOptions map[string][]AgentRunOption
-    historyModifier  func(context.Context, []Message) []Message
+type RuleRunOptions struct {
+    Strict bool
+    Locale string
+}
+
+func WithRuleLocale(locale string) adk.AgentRunOption {
+    return adk.WrapImplSpecificOptFn(func(o *RuleRunOptions) {
+        o.Locale = locale
+    })
+}
+
+func WithStrictRule(strict bool) adk.AgentRunOption {
+    return adk.WrapImplSpecificOptFn(func(o *RuleRunOptions) {
+        o.Strict = strict
+    })
+}
+
+type RuleAgent struct{}
+
+func (*RuleAgent) Name(context.Context) string { return "rule_agent" }
+
+func (*RuleAgent) Description(context.Context) string { return "执行规则校验" }
+
+func (a *RuleAgent) Run(
+    ctx context.Context,
+    input *adk.AgentInput,
+    opts ...adk.AgentRunOption,
+) *adk.AsyncIterator[*adk.AgentEvent] {
+    runOpts := adk.GetImplSpecificOptions(&RuleRunOptions{
+        Locale: "zh-CN", // 默认值
+    }, opts...)
+
+    // 这里只使用 RuleAgent 自己的 option 类型。
+    // WithSessionValues、WithChatModelOptions 等会自动被跳过。
+    log.Printf("strict=%v locale=%s", runOpts.Strict, runOpts.Locale)
+
+    iter, gen := adk.NewAsyncIteratorPair[*adk.AgentEvent]()
+    go func() {
+        defer gen.Close()
+        _ = input
+        text := fmt.Sprintf("locale=%s strict=%v", runOpts.Locale, runOpts.Strict)
+        gen.Send(adk.EventFromMessage(
+            schema.AssistantMessage(text, nil), nil, schema.Assistant, "",
+        ))
+    }()
+    return iter
 }
 ```
 
-`getComposeOptions` 做三组转换。
+调用：
 
-### 1. ChatModel options
+```go
+runner.Query(ctx, "检查合同",
+    WithStrictRule(true).DesignateAgent("rule_agent"),
+    WithRuleLocale("en-US").DesignateAgent("rule_agent"),
+    adk.WithSessionValues(map[string]any{"User": "小明"}),
+)
+```
+
+这里有两道门：
+
+```text
+第一道门：DesignateAgent("rule_agent")
+  → 当前 Agent 名不匹配，Option 根本不会传入 RuleAgent.Run
+
+第二道门：GetImplSpecificOptions[*RuleRunOptions]
+  → 名称匹配后，只有 func(*RuleRunOptions) 会真正执行
+```
+
+所以调试自定义 Option 时，必须同时检查：
+
+1. 当前 Agent 的 `Name(ctx)` 是否和 `DesignateAgent` 完全一致；
+2. Option 是否真的传到了该 Agent；
+3. `WrapImplSpecificOptFn` 的目标类型是否就是 Agent 读取的类型；
+4. Agent 是否调用了 `GetImplSpecificOptions`；
+5. 是否在读取之后又被默认值或后续逻辑覆盖。
+
+### 9.6 `WithCallbacks` 为什么看起来像被读取了两次
+
+`WithCallbacks` 使用的是 common 类型 `func(*adk.options)`。Runner 会先读取它，得到 handlers；flowAgent 在进入具体 Agent 时也会用过滤后的 options 初始化 Agent callback。
+
+这不是同一个 handler 被无意执行两次，而是两个阶段分别需要它：
+
+```text
+Runner/common 层
+  → 识别 callback option，建立本次运行的公共取消/回调上下文
+
+flowAgent/Agent 层
+  → 按当前 Agent 名称决定哪些 handler 在该 Agent 边界触发
+```
+
+Workflow 还会过滤已经在父层应用过的 callback，防止嵌套 child 因为继承 Context 又被原始 option 重复追加。详见 [Callback 与 AgentEvent](./callbacks.md)。
+
+### 9.7 这一机制的优点和代价
+
+优点：
+
+- 一份 `opts` 可以穿过 Runner、Workflow、AgentTool 和自定义 Agent；
+- 不同 Agent 不需要共享一个巨大的配置结构体；
+- 新增组件可以定义自己的 options 类型，不修改核心 `AgentRunOption`；
+- `DesignateAgent` 可以在同一棵 Agent 树里精确指定接收者。
+
+代价：
+
+- 类型不匹配通常静默忽略；
+- 只看调用点不容易知道最终谁会消费；
+- callback、cancel 等 common option 可能在多个生命周期边界被观察；
+- AgentTool 还会把子 AgentRunOption 再包成 Tool option，调试层次更多。
+
+因此排查“Option 没生效”时，不要只打印 Option 创建处，而要沿着这条顺序检查：
+
+```text
+创建函数
+  → DesignateAgent 是否允许当前 Agent
+  → Agent.Run 是否收到 opts
+  → GetImplSpecificOptions 的 T 是否一致
+  → 是否转换成 compose.Option
+  → Graph 是否把 Option 分发到目标节点
+  → 叶子 Model/Tool 是否真正读取
+```
+
+## 10. 第四层：ChatModelAgent 把 AgentRunOption 转成 compose.Option
+
+ChatModelAgent 专门读取的运行选项是：
+
+```go
+type chatModelAgentRunOptions struct {
+    chatModelOptions   []model.Option
+    toolOptions        []tool.Option
+    agentToolOptions   map[string][]AgentRunOption
+    historyModifier    func(context.Context, []Message) []Message
+    afterToolCallsHook func(context.Context) error
+}
+```
+
+三个最常用入口的转换如下：
+
+### 10.1 Model option
 
 ```text
 WithChatModelOptions([]model.Option)
   → chatModelAgentRunOptions.chatModelOptions
   → compose.WithChatModelOption(...)
-  → compose.Option{options: []model.Option}
-  → 运行时只分发给 ChatModel 节点
+  → compose.Option
+  → ChatModel node
+  → model.Generate/Stream(..., opts...)
 ```
 
-### 2. Tool options 和 AgentTool options
+### 10.2 Tool option
 
 ```text
 WithToolOptions([]tool.Option)
-  ┐
-  ├─→ []tool.Option
-  │       → compose.WithToolOption(...)
-  │       → compose.WithToolsNodeOption(...)
-  ┘       → compose.Option{options: []ToolsNodeOption}
+  → chatModelAgentRunOptions.toolOptions
+  → compose.WithToolsNodeOption(compose.WithToolOption(...))
+  → compose.Option
+  → ToolsNode
+  → Tool.InvokableRun/StreamableRun(..., opts...)
+```
 
+注意这里没有修改 `ToolsConfig.Tools`。它只是为本次调用准备参数。
+
+### 10.3 AgentTool 的内层 Agent option
+
+```text
 WithAgentToolRunOptions(map[toolName][]AgentRunOption)
-  → withAgentToolOptions(toolName, agentOpts)
-  → 一个内部 tool.Option
-  → 合并进上面的 []tool.Option
+  → 外层 ChatModelAgent 取出 map
+  → 包成一个私有 tool.Option
+  → AgentTool 被调用时按自己的工具名取回
+  → 解包成 []AgentRunOption
+  → 子 Runner.Run / Resume
 ```
 
-第二条很容看晕：AgentTool 对外就是一个 Tool，所以“传给内部 Agent 的 `AgentRunOption`”需要先包成“外层 Tool 可接收的 `tool.Option`”，等具体 AgentTool 执行时再解包。
+这就是“Option 两次换壳”：子 Agent 的 `AgentRunOption` 先伪装成外层 Tool 的 `tool.Option`，直到 AgentTool 真正执行时再还原。详细边界见 [AgentTool 与转交](./tools-transfer.md)。
 
-```mermaid
-flowchart LR
-    ARO["AgentRunOption"] --> CMO["chatModelAgentRunOptions"]
-    CMO --> CO["compose.Option"]
-    CO --> Extract["Graph extractOption"]
+### 10.4 Resume 时的 HistoryModifier
 
-    Extract --> ModelNode["ChatModel node"] --> MO["[]model.Option"] --> Provider["模型 Provider"]
-    Extract --> ToolsNode["ToolsNode"] --> TO["[]tool.Option"] --> Tool["普通 Tool"]
-    TO --> AgentToolOpt["AgentTool 私有 option"] --> ChildOpts["[]AgentRunOption"] --> ChildRunner["子 Runner"]
+旧 `WithHistoryModifier` 也会被转成 `compose.WithStateModifier`，在恢复 Graph state 时修改 `*adk.State.Messages`。新版推荐通过 `ChatModelAgentResumeData.HistoryModifier` 传入，语义仍是“恢复前改写 Graph state”，不是修改 Config。
 
-    Path["NodePath 可选定节点"] -. "先按路径，再按 option type" .-> Extract
-```
+## 11. 第五层：compose.Option 如何分发到 Graph 节点
 
-<p class="diagram-caption">Option 不会“一股脑传到底”：每一层拆信封，只拿属于自己的类型；AgentTool 因为外表是 Tool，会发生一次额外的包装与解包。</p>
+`compose.Option` 是运行时 envelope，可能包含：
 
-### 3. History modifier
-
-已废弃的 `WithHistoryModifier` 被转成 `compose.WithStateModifier`，它在恢复前将 Graph state 断言为 `*adk.State`，再改写 `Messages`。新 API 是通过 `ChatModelAgentResumeData.HistoryModifier` 提供，但最终仍转成同样的 state modifier。
-
-`ChatModelAgent.Run` 还会无条件追加内部 `bridgeCheckpointID`，让 ADK 外层 checkpoint 能将 compose 子图状态作为一块字节桥接起来。
-
-## 九、compose.Option 如何分发到正确节点
-
-`compose.Option` 是一个运行时信封，可以装载：
-
-- `options []any`：具体组件 Option；
+- 具体组件 options；
 - callback handlers；
-- `paths []*NodePath`：目标节点/子图路径；
+- `NodePath`；
 - checkpoint ID、state modifier、最大步数等 Graph 运行配置。
 
-Graph 运行前的 `extractOption` 按两种规则分发。
+Graph 的 `extractOption` 主要按两种模式分发：
 
-### 没有指定 path
+### 11.1 没有 NodePath：按类型广播过滤
 
-- 普通组件节点：比较 `reflect.TypeOf(opt.options[0])` 与节点声明的 `optionType`，类型相同才分发；
-- 子图节点：将整个 `compose.Option` 传给子图，让子图继续做下一层分发；
-- 纯 callback Option：回调已经被加到 Context，不作为普通 options 发给组件。
+```text
+compose.Option{model.Option}
+  → 只交给声明接收 model.Option 的 ChatModel node
 
-### 指定 path
+compose.Option{ToolsNodeOption}
+  → 只交给 ToolsNode
 
-例如只想影响 `ReAct/tools`：
+无法匹配的节点
+  → 不消费，不会把 model.Option 错传给 Tool
+```
+
+### 11.2 指定 NodePath：先按路径下沉，再按类型
 
 ```text
 NodePath["ReAct", "tools"]
-  ↓ 外层 Chain 发现 ReAct 是子图
-NodePath["tools"]
-  ↓ ReAct Graph 找到 tools 节点
-ToolsNodeOption
+  → 外层 Chain 发现 ReAct 是子图
+  → 下沉为 NodePath["tools"]
+  → ReAct Graph 找到 tools 节点
+  → ToolsNode 接收 ToolsNodeOption
 ```
 
-如果 path 指向不存在的 node，或将 `model.Option` 指派给只接收 `ToolsNodeOption` 的 node，`extractOption` 会显式报错。而没有 path 时依靠类型做广播过滤。
+如果 path 指向不存在的节点，或把 `model.Option` 指给只接收 `ToolsNodeOption` 的节点，Graph 会显式报错。没有 path 时则依赖类型过滤。
 
-## 十、最后一公里：model.Option 与 tool.Option
+## 12. 第六层：Model 与 Tool 读取自己的叶子 Option
 
-### model.Option
+### 12.1 Model option
 
-ChatModel node 收到 `[]any` 后，通用 wrapper 会断言成 `[]model.Option`，再传给实际 provider 的 `Generate/Stream`。Provider 可以同时读取：
+Model 侧有两类 option：
 
-- model package 定义的 common options；
-- 某个 provider 自己的 implementation-specific options。
+```text
+model.WithTemperature(0.2)
+model.WithMaxTokens(512)
+model.WithToolChoice(...)
+  → model.Option.apply
+  → model.GetCommonOptions
+  → provider 的 Options
+```
 
-例如 temperature、stop words、模型请求的额外参数，都应该在这一条链中传递，而不是塞进 Context value。
+也可以有 provider 自己的 implementation-specific option：
 
-### ToolsNodeOption 再到 tool.Option
+```go
+func WithProviderParam(v string) model.Option {
+    return model.WrapImplSpecificOptFn(func(o *providerOptions) {
+        o.Param = v
+    })
+}
+```
 
-ToolsNode 先解析自己的 Option，拿到其中的 `ToolOptions`。真正调用某个 Tool 时，这些 `tool.Option` 才会传到 Tool 的 `InvokableRun` 或 `StreamableRun`。Tool 内部再用与 ADK 类似的 implementation-specific 解析机制拿到自己能识别的配置。
+ADK 不应该把 temperature 塞进 Context value；它属于 Model 调用 option。
+
+### 12.2 Tool option
+
+Tool option 的读取完全由 Tool 实现负责：
+
+```go
+type lookupOptions struct{ Prefix string }
+
+func withPrefix(prefix string) tool.Option {
+    return tool.WrapImplSpecificOptFn(func(o *lookupOptions) {
+        o.Prefix = prefix
+    })
+}
+
+func (t *LookupTool) InvokableRun(
+    ctx context.Context,
+    argumentsInJSON string,
+    opts ...tool.Option,
+) (string, error) {
+    options := tool.GetImplSpecificOptions[lookupOptions](nil, opts...)
+    // 使用 options.Prefix 执行本次调用
+    return options.Prefix + "result", nil
+}
+```
+
+完整路径是：
 
 ```text
 AgentRunOption
   → chatModelAgentRunOptions.toolOptions
   → compose.Option<ToolsNodeOption>
   → ToolsNodeOptions.ToolOptions
-  → []tool.Option
-  → 某个 Tool 的 impl-specific options
+  → tool.Option
+  → 具体 Tool 的 impl-specific options
 ```
 
-这就是为什么不能把 `WithToolOptions` 直接理解为“它改了 ToolsConfig”。`ToolsConfig` 是静态的工具结构；`WithToolOptions` 携带的是这一次 tool invocation 的参数。
+## 13. 静态拓扑与动态参数的边界
 
-## 十一、ADK 额外注入的运行 Option
+下面这张表是最实用的选型速查：
 
-除了用户传入的 Option，ChatModelAgent 还会根据运行情况动态追加：
-
-| 条件 | 追加的 Option | 用途 |
+| 想改变什么 | 应该使用 | 不应该使用 |
 | --- | --- | --- |
-| 所有 Run/Resume | `compose.WithCheckPointID(bridgeCheckpointID)` | ADK 与 compose checkpoint 桥接 |
-| `EmitInternalEvents=true` | ToolsNode → ToolOption → event generator | 向外转发 AgentTool 内部事件 |
-| `AgentInput.EnableStreaming=true` | ToolsNode → ToolOption → streaming flag | 让 AgentTool 内层按流式运行 |
-| 每次模型/Tool 调用 | 默认 event sender wrappers | 将 model/tool 输出转成 AgentEvent |
-| 使用 `adk.WithCallbacks` | Agent callback handlers | 观察 Input/ResumeInfo 和独立 AgentEvent iterator |
-| 使用 `adk.WithCancel` | cancel context + model/tool monitors | immediate 或安全点取消 |
+| 增加一个长期可用 Tool | `ToolsConfig.Tools` | `WithToolOptions` |
+| 每次 Run 动态决定 Tool | 新版 `Handlers.BeforeAgent` | 修改原始 Config |
+| 改本次模型 temperature | `WithChatModelOptions(model.WithTemperature(...))` | Context value |
+| 给本次 Tool 传业务参数 | `WithToolOptions` | 重新构造 Agent |
+| 给某个 Agent 传参数 | `.DesignateAgent(name)` | 在 Tool 名称上猜测 |
+| 给 AgentTool 的子 Agent 传参数 | `WithAgentToolRunOptions` | 普通 `WithToolOptions` |
+| 给模型前的消息做裁剪 | `BeforeModelRewriteState` / 内置 reduction | Callback 原地改 input |
+| 保存跨 Run 状态 | Session/Checkpoint/外部 Store | 把状态塞进 Config |
 
-这些都是运行期 Option，不会回写用户的 `ChatModelAgentConfig`。
+核心判断是：**拓扑放 Config，单次参数放 Option，模型上下文放 State，跨请求数据放 Store。**
 
-## 十二、Resume 时的配置反向转换
+## 14. Resume：恢复不是重新 Query
 
-Resume 有两条同时发生的恢复链。
+Resume 同时恢复两条链：
 
-### ADK 层：恢复目标进 Context
+### 14.1 Runner 层
 
 ```text
-ResumeParams.Targets map[interruptID]data
-  → core.BatchResumeWithData(ctx, targets)
-  → globalResumeInfo
-  → AppendAddressSegment 形成 Address 后，反查该 Address 对应的 interrupt ID 并领取
+Runner.Resume(checkPointID, opts...)
+  → 从 CheckPointStore 读取 checkpoint
+  → 恢复 runContext / runSession / interrupt tree
+  → 恢复原始 streaming 模式
+  → 将本次新 AgentRunOption 叠加到恢复运行
 ```
 
-这里的 map key 必须使用中断事件返回的 `InterruptCtx.ID`，不是 `Address.String()`；Address 是框架内部重新对齐组件位置的依据。详细匹配见 [Context 的逐层传播](./context-flow.md) 和 [中断、检查点与恢复](./interrupt-resume.md)。
+Resume 时 `WithSessionValues` 可以写入新的 session value；但它不会清空 checkpoint 中已有的 Values。
 
-### ChatModelAgent 层：恢复数据变成 state modifier
+### 14.2 Graph 层
 
 ```text
 ChatModelAgentResumeData.HistoryModifier
   → compose.WithStateModifier
-  → 恢复 Graph state 时修改 *adk.State.Messages
+  → 恢复 Graph state 时改写 state.Messages
+
+checkpoint 中的 []byte
+  → bridgeStore
+  → ChatModelAgent.Resume
+  → 同一 ReAct/Chain 拓扑继续运行
 ```
 
-同时 checkpoint 中的 `[]byte` 被包成 `newResumeBridgeStore(stateByte)`，再作为 compose checkpoint store 交给重新编译的 runnable。所以 Resume 不是特殊的另一套 Graph，而是“同一构图逻辑 + 恢复 store + runtime state modifier + Context 中的定位数据”。
+因此 Resume 不是“重新创建一个全新的 Graph”，而是**同一构图逻辑 + 恢复 Store + state modifier + interrupt 定位数据**。
 
-## 十三、一个完整例子的转换过程
+`ResumeParams.Targets` 的 key 需要使用中断事件返回的 interrupt ID；Address 是框架内部用于重新定位组件的路径，两者不能混用。详见 [中断、检查点与恢复](./interrupt-resume.md)。
+
+## 15. 把完整 Demo 拆成 8 个观察点
+
+以 `docs/examples/adk-config-options/main.go` 为例，可以在断点或日志中依次观察：
+
+```text
+观察点 1：NewChatModelAgent
+  → Config 进入 Agent 长期字段
+
+观察点 2：NewRunner
+  → RunnerConfig 进入 TypedRunner
+
+观察点 3：Runner.Query
+  → query 变成 UserMessage
+
+观察点 4：getCommonOptions
+  → SessionValues / ChatModelOptions / ToolOptions 各自封装
+
+观察点 5：flowAgent
+  → 按 Agent 名称过滤 DesignateAgent
+
+观察点 6：ChatModelAgent.getRunFunc
+  → 基准 execContext + 本次 BeforeAgent
+
+观察点 7：getComposeOptions + Graph.extractOption
+  → model.Option 和 tool.Option 分别进入 Model/ToolsNode
+
+观察点 8：叶子组件
+  → model.GetCommonOptions / tool.GetImplSpecificOptions 真正读取参数
+```
+
+只要在这八个点打印对象，就不会再把“Config 没生效”“Option 没生效”“State 没恢复”混成同一类问题。
+
+## 16. 常见错误与正确修复
+
+### 错误 1：构造后修改原 Config
 
 ```go
-iter := runner.Query(ctx, "查天气",
-    adk.WithSessionValues(map[string]any{"User": "Alice"}),
-    adk.WithChatModelOptions([]model.Option{modelOpt}),
-    adk.WithToolOptions([]tool.Option{toolOpt}),
-)
+conf.Instruction = "new instruction" // 不应作为动态更新 API
 ```
 
-这三个 Option 并不在同一层被一次性解析：
+构造器会把配置归一化并保存到 Agent。需要按请求动态修改，应使用新版 Handler 的 `BeforeAgent`，修改本次 `ChatModelAgentContext`。
 
-1. Runner 用 `GetImplSpecificOptions[adk.options]` 只识别 `WithSessionValues`；
-2. `AddSessionValues` 把 `User=Alice` 写入 runSession；
-3. flowAgent 按 Agent 名称过滤 Option；
-4. ChatModelAgent 用 `GetImplSpecificOptions[chatModelAgentRunOptions]` 识别后两个；
-5. `modelOpt` 被包成 `compose.WithChatModelOption`；
-6. `toolOpt` 先进 `compose.WithToolOption`，再被 `compose.WithToolsNodeOption` 外包；
-7. Graph `extractOption` 将两类信封分发到 ChatModel node 和 ToolsNode；
-8. ChatModel provider 最终解析 `modelOpt`；
-9. 真正的 Tool 在被调用时最终解析 `toolOpt`；
-10. system prompt 在 `defaultGenModelInput` 中从 Context 读 session，将 `{User}` 替换为 `Alice`。
+### 错误 2：用 WithToolOptions 添加 Tool
 
-这个例子同时说明：Option 传播链与 Context 传播链是并行的。Option 负责显式调用参数，Context 负责跨层运行环境。
+`WithToolOptions` 只携带调用参数，不携带 `tool.BaseTool`。新增工具应放入 `ToolsConfig.Tools`，或在 `BeforeAgent` 修改本次 `runCtx.Tools`。
 
-## 十四、常见误区
+### 错误 3：把所有 AgentRunOption 都当成全树广播
 
-### 误区 1：改了 Config，已构建的 Agent 会自动变
+`DesignateAgent` 会按名称过滤；Workflow 还会过滤已经在父层应用过的 Callback，避免嵌套 Agent 重复触发。AgentTool 的子 Agent option 还必须经过 `WithAgentToolRunOptions` 包装。
 
-Config 在构造时被拷贝/归一化。构造后修改原 Config 不应被当成动态更新 API。需要按请求改变 instruction 或真实工具时，用 `Handlers.BeforeAgent` 返回本次运行配置；不要修改原 Config 或 Agent 的私有字段。
+### 错误 4：把 `MaxIterations` 和 `MaxRunSteps` 当成一个数字
 
-### 误区 2：WithToolOptions 可以在运行时新增 Tool
+- `MaxIterations`：ReAct 语义下的模型生成轮数；
+- `MaxRunSteps`：compose executor 的图步骤保护。
 
-`WithToolOptions` 传递的是 `tool.Option`，不是 `tool.BaseTool`。要增加工具，应放入静态 `ToolsConfig`，或在新版 Middleware 的 `BeforeAgent` 修改 `runCtx.Tools`。旧 `AdditionalTools` 只用于兼容。
+一轮 ReAct 可能包含 ChatModel、条件边、ToolsNode 等多个 Graph step，两者不是 1:1。
 
-### 误区 3：所有 AgentRunOption 都会传到所有子 Agent
+### 错误 5：把 Callback 当作修改 Model input 的地方
 
-`DesignateAgent` 会做名称过滤；AgentTool 的内层 Agent Option 还需要通过 `WithAgentToolRunOptions` 按 tool name 包装传递。
+Callback 是观察协议，输入输出可能被多个 Handler 共享。要改 `state.Messages`、ToolInfo 或 instruction，使用 Middleware 对应阶段的 hook。
 
-### 误区 4：compose.Option 被放在 Context 里
+## 17. 源码阅读顺序
 
-大部分组件 Option 走函数参数与 `extractOption` 分发，不是 Context value。Callback manager、Graph state、checkpoint/resume 辅助信息才会在运行中进入 Context。
+建议按下面顺序读，而不是从文件名随机跳转：
 
-### 误区 5：MaxIterations 就是 MaxRunSteps
+1. `adk/runner.go`：Config 如何进入 Runner，Query/Resume 如何启动；
+2. `adk/call_option.go`：common option、`WrapImplSpecificOptFn`、`DesignateAgent`；
+3. `adk/chatmodel.go`：Agent Config、`prepareExecContext`、`applyBeforeAgent`、`getComposeOptions`；
+4. `adk/react.go`：ReAct config 如何变成 Graph；
+5. `compose/graph_call_options.go`、`compose/utils.go`：Option envelope 和 `extractOption`；
+6. `compose/tool_node.go`：ToolsNodeOption 如何变成 Tool option；
+7. `components/model/option.go`、`components/tool/option.go`：叶子组件如何读取 option；
+8. `docs/examples/adk-config-options/main.go`：用日志验证上面的每一步。
 
-`MaxIterations` 是 ReAct 语义下的模型生成轮次；`MaxRunSteps` 是 compose executor 的通用图步数保护。一轮 ReAct 可以包含 ChatModel、分支、ToolsNode 等多个 graph step，两者不是 1:1。
-
-## 十五、源码定位清单
-
-| 要追踪的问题 | 源码文件 |
-| --- | --- |
-| RunnerConfig 如何落到 Runner | `adk/runner.go` |
-| AgentRunOption 的泛型函数包装 | `adk/call_option.go` |
-| ChatModelAgentConfig 归一化 | `adk/chatmodel.go` 的 `NewChatModelAgent` |
-| 首次冻结基准 exec context | `adk/chatmodel.go` 的 `prepareExecContext` / `buildRunFunc` |
-| 每次运行生成动态 exec context | `adk/chatmodel.go` 的 `applyBeforeAgent` / `getRunFunc` |
-| 经典/Agentic 运行分支 | `adk/chatmodel.go`、`adk/react.go` |
-| ADK Option 转 compose.Option | `adk/chatmodel.go` 的 `getComposeOptions` |
-| reactConfig 转 Graph | `adk/react.go` 的 `newReact` |
-| ToolsNodeConfig 与 ToolOptions | `compose/tool_node.go` |
-| compose.Option 定义 | `compose/graph_call_options.go` |
-| Option 按类型/path 分发 | `compose/utils.go` 的 `extractOption` |
-| GraphCompileOption | `compose/graph_compile_options.go` 与编译执行代码 |
-| model/tool 叶子 Option | `components/model/option.go`、`components/tool/option.go` |
-
-读源码时可以始终问三个问题：这个配置是构造时还是调用时生效？它的最终消费者是 Runner、Graph、Model 还是 Tool？它通过函数 options 传递，还是在 Context 中传播？能回答这三个问题，配置链就不会再混乱。
+最后始终问三个问题：**这个值在哪一层创建？最终谁读取？它影响的是拓扑、一次调用，还是运行状态？** 只要这三个问题能回答，Config 与 Option 的转换链就不会混乱。

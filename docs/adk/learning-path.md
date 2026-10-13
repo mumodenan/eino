@@ -85,7 +85,7 @@ flowchart TD
 2. [Context 的逐层传播](./context-flow.md)：`ctx`、`runContext`、`runSession`、地址和并行 lane 的关系。
 3. [Runner 持久化读写链](./runner-persistence.md)：状态怎样从内存编码到 `CheckPointStore`。
 4. [中断、检查点与恢复](./interrupt-resume.md)：interrupt tree、叶子状态和 Resume 协议。
-5. [Config 与 Option 转换](./config-option-flow.md)：配置如何进入实际执行。
+5. [Config 与 Option 转换](./config-option-flow.md)：配置如何进入实际执行；配套可运行示例位于仓库 `docs/examples/adk-config-options`。
 
 ```text
 Go context.Context
